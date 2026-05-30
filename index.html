@@ -274,40 +274,85 @@ After searching ALL sources, respond with ONLY this raw JSON — no markdown, no
   }
 }`;
 
-/* ── API CALL with history trimming ── */
+/* ── API CALL with retry + fallback ── */
+// Model priority: compound-beta (web search) → compound-beta-mini (faster, less rate limited) → llama-3.3-70b-versatile (no web search, fallback)
+const MODELS = ['compound-beta', 'compound-beta-mini', 'llama-3.3-70b-versatile'];
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function tryModel(model, messages) {
+  const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Authorization": `Bearer ${API_KEY}` },
+    body: JSON.stringify({ model, messages, temperature: 0.6, max_tokens: 1200 })
+  });
+  const data = await res.json();
+  return { res, data };
+}
+
 async function callGroq(userMsg) {
   if (location.protocol === 'file:') throw new Error('Open via GitHub Pages or VS Code Live Server, not file://');
 
   history.push({ role: "user", content: userMsg });
-  // Keep only last 4 messages to avoid "request entity too large"
-  const trimmed = history.slice(-4);
+  const trimmed = history.slice(-4); // keep last 4 msgs to stay under size limit
+  const messages = [{ role: "system", content: SYSTEM_PROMPT }, ...trimmed];
 
-  let res;
-  try {
-    res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${API_KEY}` },
-      body: JSON.stringify({
-        model: "compound-beta",
-        messages: [{ role: "system", content: SYSTEM_PROMPT }, ...trimmed],
-        temperature: 0.6,
-        max_tokens: 1200
-      })
-    });
-  } catch(e) { throw new Error('Network error — check connection or API key at console.groq.com'); }
+  let lastError = '';
+  for (let i = 0; i < MODELS.length; i++) {
+    const model = MODELS[i];
+    try {
+      // If retrying after rate limit, wait before each attempt
+      if (i > 0) {
+        updateTypingLabel(`⏳ Rate limited on ${MODELS[i-1]}, trying ${model}...`);
+        await sleep(i * 8000); // 8s, 16s
+      }
 
-  const data = await res.json();
-  if (data.error) {
-    if (res.status === 401) throw new Error('Invalid API key — get a new one at console.groq.com/keys');
-    if (res.status === 429) throw new Error('Rate limit hit. Wait 30s and try again.');
-    if (res.status === 413) { history.length = 0; throw new Error('History too large — cleared. Please try again.'); }
-    throw new Error(data.error.message || JSON.stringify(data.error));
+      const { res, data } = await tryModel(model, messages);
+
+      if (res.status === 429) {
+        // Extract retry-after header if available
+        const retryAfter = parseInt(res.headers?.get?.('retry-after') || '0');
+        if (retryAfter > 0 && i === 0) {
+          updateTypingLabel(`⏳ Rate limited. Waiting ${retryAfter}s then retrying...`);
+          await sleep(retryAfter * 1000);
+          // retry same model once
+          const retry = await tryModel(model, messages);
+          if (!retry.data.error) {
+            const msg = retry.data.choices[0].message;
+            history.push({ role: "assistant", content: (msg.content||'').slice(0, 600) });
+            return { text: msg.content||'', tools: msg.executed_tools||[], modelUsed: model };
+          }
+        }
+        lastError = `Rate limited on ${model}`;
+        continue; // try next model
+      }
+
+      if (res.status === 401) throw new Error('Invalid API key — get a new one at console.groq.com/keys');
+      if (res.status === 413) { history.length = 0; throw new Error('Request too large — history cleared. Try again.'); }
+
+      if (data.error) {
+        lastError = data.error.message || JSON.stringify(data.error);
+        continue; // try next model
+      }
+
+      const msg = data.choices[0].message;
+      const text = msg.content || '';
+      const tools = msg.executed_tools || [];
+      history.push({ role: "assistant", content: text.slice(0, 600) });
+      return { text, tools, modelUsed: model };
+
+    } catch(e) {
+      if (e.message.includes('Invalid API key') || e.message.includes('history cleared')) throw e;
+      lastError = e.message;
+    }
   }
-  const msg = data.choices[0].message;
-  const text = msg.content || '';
-  const tools = msg.executed_tools || [];
-  history.push({ role: "assistant", content: text.slice(0, 800) }); // trim stored response
-  return { text, tools };
+
+  throw new Error(`All models rate limited. Please wait 1 minute and try again. (${lastError})`);
+}
+
+function updateTypingLabel(msg) {
+  const el = document.getElementById('typing-label');
+  if (el) el.textContent = msg;
 }
 
 /* ── PARSE ── */
@@ -549,7 +594,7 @@ function showTyping() {
   const w = document.getElementById('messages');
   const d = document.createElement('div');
   d.id = 'typing-ind'; d.className = 'msg bot';
-  d.innerHTML = `<div class="msg-label">StockAI</div><div class="bubble"><div class="searching-label">🔍 Searching Yahoo Finance, Twitter/X, analyst reports...</div><div class="typing"><span></span><span></span><span></span></div></div>`;
+  d.innerHTML = `<div class="msg-label">StockAI</div><div class="bubble"><div class="searching-label" id="typing-label">Searching Yahoo Finance, Twitter/X, analyst reports...</div><div class="typing"><span></span><span></span><span></span></div></div>`;
   w.appendChild(d); w.scrollTop = w.scrollHeight;
 }
 function removeTyping(){ const t=document.getElementById('typing-ind'); if(t) t.remove(); }
@@ -563,13 +608,17 @@ async function sendMessage() {
   addMsg('user', esc(text));
   showTyping();
   try {
-    const { text: raw, tools } = await callGroq(text);
+    const { text: raw, tools, modelUsed } = await callGroq(text);
     const data = parseResponse(raw);
     removeTyping();
-    addBotCard('📡 Full analysis complete:', buildCard(data, tools));
+    const hasWeb = modelUsed !== 'llama-3.3-70b-versatile';
+    const modelNote = hasWeb
+      ? `Live analysis complete <span style="font-family:var(--mono);font-size:10px;color:var(--muted)">(${modelUsed})</span>:`
+      : `Analysis complete <span style="font-family:var(--mono);font-size:10px;color:var(--amber)">(${modelUsed} - no live web search, using training data)</span>:`;
+    addBotCard(modelNote, buildCard(data, tools));
   } catch(e) {
     removeTyping();
-    addMsg('bot', `<span style="color:#f87171">⚠ ${esc(e.message)}</span>`);
+    addMsg('bot', `<span style="color:#f87171">Error: ${esc(e.message)}</span>`);
     console.error(e);
   }
   btn.disabled = false; input.focus();
